@@ -296,9 +296,17 @@ DEFAULT_TOOLS = '''\
 """
 tools.py — Built-in tools for the agentic DAG.
 Deterministic helpers + web/search/selenium. ToolFoundry appends new ones below.
+
+Notes:
+- Indentation is spaces-only to avoid TabError.
+- Browser helpers are designed for agentic N-step loops:
+    1) act (navigate/click/input/press/scroll/eval_js)
+    2) observe (query/exists/count/observe/dom/text/attrs/screenshot/url)
+    3) decide next action based on the observation
+- Tools.input accepts **kwargs and aliases "prompt"→text for backward compatibility.
 """
 
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Tuple
 from pathlib import Path
 import json, re, statistics, os, sys, csv, time, platform, shutil, subprocess, tempfile, uuid, html, io, glob, traceback
 from datetime import datetime, UTC
@@ -663,13 +671,14 @@ def system_specs() -> Dict[str, Any]:
 
 # ── Networking (urllib stdlib) ────────────────────────────────────────────────
 def http_get(url: str, headers: Optional[Dict[str,str]] = None, timeout_s: int = 20, parse_json: bool=True) -> Dict[str, Any]:
+    "Simple HTTP GET using stdlib. Optionally parse JSON by content-type or body shape."
     req = request.Request(url, headers=headers or {})
     try:
         with request.urlopen(req, timeout=timeout_s) as resp:
             body = resp.read()
             ct = resp.headers.get("Content-Type","")
             out = {"status": resp.status, "headers": dict(resp.headers)}
-            if parse_json and ("json" in ct or body.strip().startswith(b"{") or body.strip().startswith(b"[")):
+            if parse_json and ("json" in ct or body.strip().startswith(b"{") or body.strip().startsWith(b"[")):
                 try:
                     out["json"] = json.loads(body.decode("utf-8", errors="replace"))
                 except Exception:
@@ -683,6 +692,7 @@ def http_get(url: str, headers: Optional[Dict[str,str]] = None, timeout_s: int =
         return {"status": 0, "error": str(e)}
 
 def http_post_json(url: str, data: Any, headers: Optional[Dict[str,str]] = None, timeout_s: int = 20) -> Dict[str, Any]:
+    "Simple HTTP POST with JSON body using stdlib."
     payload = json.dumps(data).encode("utf-8")
     base_headers = {"Content-Type":"application/json"}
     if headers: base_headers.update(headers)
@@ -702,6 +712,7 @@ def http_post_json(url: str, data: Any, headers: Optional[Dict[str,str]] = None,
         return {"status": 0, "error": str(e)}
 
 def web_read_text(url: str, timeout_s: int = 20) -> Dict[str, Any]:
+    "Fetch URL and return {'status','headers','title','text'} with HTML stripped to plain text (best-effort)."
     out = http_get(url, timeout_s=timeout_s, parse_json=False)
     txt = out.get("text","")
     title = None
@@ -717,191 +728,40 @@ def web_read_text(url: str, timeout_s: int = 20) -> Dict[str, Any]:
     if title: out["title"] = title
     return out
 
-def network_ping(host: str, count: int = 1, timeout_s: int = 5) -> Dict[str, Any]:
-    if sys.platform.startswith("win"):
-        cmd = ["ping", "-n", str(count), "-w", str(timeout_s*1000), host]
-    else:
-        cmd = ["ping", "-c", str(count), "-W", str(timeout_s), host]
+# ── Minimal BeautifulSoup scrape helper (used by search) ─────────────────────
+def bs4_scrape(url: str, timeout_s: int = 10, full_html: bool = False) -> str:
+    """
+    Quick scrape via 'requests' and BeautifulSoup.
+    Returns plain text by default; set full_html=True to return raw HTML.
+    """
+    import requests
+    from bs4 import BeautifulSoup
+    headers = {"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"}
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_s+2)
-        return {"ok": proc.returncode == 0, "returncode": proc.returncode, "stdout": proc.stdout[-2000:], "stderr": proc.stderr[-2000:]}
+        r = requests.get(url, headers=headers, timeout=timeout_s)
+        r.raise_for_status()
     except Exception as e:
-        return {"ok": False, "returncode": -1, "stderr": str(e)}
+        log_message(f"[bs4_scrape] error: {e}", "ERROR")
+        return ""
+    if full_html:
+        return r.text
+    soup = BeautifulSoup(r.text, "html.parser")
+    for tag in soup(["script","style","noscript","form","header","footer","nav","aside"]):
+        tag.decompose()
+    return soup.get_text(separator=" ", strip=True)
 
-def wifi_scan() -> Dict[str, Any]:
-    cmds = []
-    if sys.platform.startswith("linux"):
-        cmds.append(["nmcli","-f","SSID,BSSID,SIGNAL,CHAN,SECURITY","dev","wifi","list"])
-        cmds.append(["iwlist","scan"])
-    elif sys.platform == "darwin":
-        cmds.append(["/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport","-s"])
-    elif sys.platform.startswith("win"):
-        cmds.append(["netsh","wlan","show","networks","mode=bssid"])
-    for cmd in cmds:
-        try:
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=4)
-            if proc.returncode != 0: continue
-            raw = proc.stdout
-            nets = []
-            if "nmcli" in cmd[0]:
-                lines = raw.splitlines()[1:]
-                for line in lines:
-                    cols = re.split(r"\\s{2,}", line.strip())
-                    if not cols: continue
-                    ent = {"ssid": cols[0]}
-                    if len(cols)>1: ent["bssid"] = cols[1]
-                    if len(cols)>2: ent["signal"] = cols[2]
-                    if len(cols)>3: ent["channel"] = cols[3]
-                    if len(cols)>4: ent["security"] = cols[4]
-                    nets.append(ent)
-            elif "airport" in cmd[0]:
-                lines = raw.splitlines()[1:]
-                for line in lines:
-                    cols = re.split(r"\\s{2,}", line.strip())
-                    if not cols: continue
-                    ent = {"ssid": cols[0]}
-                    if len(cols)>1: ent["bssid"] = cols[1]
-                    if len(cols)>2: ent["signal"] = cols[2]
-                    if len(cols)>3: ent["channel"] = cols[3]
-                    if len(cols)>6: ent["security"] = cols[6]
-                    nets.append(ent)
-            elif "netsh" in cmd[0]:
-                cur = {}
-                for line in raw.splitlines():
-                    line = line.strip()
-                    if re.match(r"SSID\\s+\\d+\\s+:\\s+.*", line, re.I):
-                        if cur: nets.append(cur); cur = {}
-                        cur["ssid"] = line.split(":",1)[1].strip()
-                        continue
-                    if re.match(r"BSSID\\s+\\d+\\s+:\\s+.*", line, re.I):
-                        cur["bssid"] = line.split(":",1)[1].strip(); continue
-                    if line.lower().startswith("signal"):
-                        cur["signal"] = line.split(":",1)[1].strip(); continue
-                    if line.lower().startswith("channel"):
-                        cur["channel"] = line.split(":",1)[1].strip(); continue
-                    if line.lower().startswith("authentication"):
-                        cur["security"] = line.split(":",1)[1].strip(); continue
-                if cur: nets.append(cur)
-            if nets:
-                return {"ok": True, "networks": nets, "raw": raw[:4000]}
-        except Exception:
-            continue
-    return {"ok": False, "networks": [], "error": "no supported wifi scanner available or insufficient permissions"}
-
-# ── Context aggregation ───────────────────────────────────────────────────────
-def context_pack(goal: str, kb_limit: int = 128) -> Dict[str, Any]:
-    pack: Dict[str, Any] = {"goal": goal, "ts": _now_iso()}
-    try:
-        pack["workspace"] = workspace_info()
-    except Exception: pass
-    try:
-        pack["recent"] = ctx_bus_tail_tool(20)
-    except Exception: pass
-    try:
-        disc = project_discover(".")
-        pack["project"] = {"root": disc.get("root"), "hints": disc.get("hints"), "languages": disc.get("languages")}
-    except Exception: pass
-    try:
-        rd = ""
-        for name in ["README.md","Readme.md","readme.md"]:
-            p = Path(name)
-            if p.exists():
-                rd = file_read(name, max_bytes=20000)
-                break
-        if rd: pack["readme_excerpt"] = rd[: min(len(rd), kb_limit*1024)]
-    except Exception: pass
-    try:
-        pack["tools"] = tool_list()[:200]
-    except Exception: pass
-    return pack
-
-# ── Time/clock helpers ────────────────────────────────────────────────────────
-class UtilityTools:
-    "Miscellaneous helpers."
-    @staticmethod
-    def now(tz: str = "UTC") -> dict:
-        iso = datetime.now(UTC).replace(microsecond=0).isoformat()
-        return {"timestamp": iso}
-    @staticmethod
-    def now_iso(tz: str = "UTC") -> str:
-        return datetime.now(UTC).replace(microsecond=0).isoformat()
-    @staticmethod
-    def load_json(name: str) -> dict:
-        p = (DATA_DIR / f"{name}.json")
-        if not p.exists():
-            return {}
-        try:
-            return json.loads(p.read_text())
-        except Exception:
-            return {}
-
-# ── Browser, search & scraping tools (directional aux summaries) ─────────────
+# ── Browser, search & scraping tools (agentic-ready) ─────────────────────────
 class Tools:
+    """
+    High-level browser + scraping helpers designed for agentic, iterative control.
+    Each method is idempotent where possible and returns concise, JSON-serializable data.
+    """
     _driver = None  # Selenium WebDriver singleton
 
-    # --- Aux summary plumbing (directional, via systems.json → Ollama) ---
-    @staticmethod
-    def _read_config() -> Dict[str, Any]:
-        try:
-            return json.loads(CONFIG_PATH.read_text())
-        except Exception:
-            return {"host": os.environ.get("OLLAMA_HOST","http://localhost:11434"), "model": os.environ.get("OLLAMA_MODEL","")}
-
-    @staticmethod
-    def _read_aux_directive() -> str:
-        try:
-            systems = json.loads(SYSTEMS_PATH.read_text())
-            return systems.get("aux_directive","You are a focused, evidence-grounded summarizer. Keep it to 2–3 sentences.")
-        except Exception:
-            return "You are a focused, evidence-grounded summarizer. Keep it to 2–3 sentences."
-
-    @staticmethod
-    def auxiliary_inference(prompt: str, temperature: float = 0.3, system_directive: Optional[str] = None, max_chars: int = 1600, model_name: Optional[str] = None, timeout_s: int = 15) -> str:
-        """
-        Use local Ollama (if configured) to generate a short, directional summary.
-        Falls back to a deterministic heuristic if Ollama/config is unavailable.
-        """
-        # Heuristic fallback
-        def _simple_summary(text: str, max_sentences: int = 3) -> str:
-            s = (text or "").strip()[:max_chars]
-            parts = re.split(r"(?<=[.!?])\\s+", s)
-            parts = [x for x in parts if x]
-            return " ".join(parts[:max_sentences]) if parts else (s[:300] + ("..." if len(s) > 300 else ""))
-
-        cfg = Tools._read_config()
-        host = (cfg.get("host") or "http://localhost:11434").rstrip("/")
-        model = model_name or cfg.get("model") or ""
-
-        directive = (system_directive or Tools._read_aux_directive()).strip()
-        if not host or not model:
-            # no configured LLM; fallback
-            return _simple_summary(prompt)
-
-        try:
-            url = f"{host}/api/chat"
-            messages = [
-                {"role":"system","content": directive},
-                {"role":"user","content": prompt}
-            ]
-            payload = {"model": model, "messages": messages, "stream": False, "options": {"temperature": float(temperature)}}
-            with httpx.Client(timeout=timeout_s) as client:
-                r = client.post(url, json=payload)
-                r.raise_for_status()
-                data = r.json()
-                msg = (data.get("message") or {}).get("content","").strip()
-                if msg:
-                    return msg
-                # some servers return responses list
-                if isinstance(data.get("messages"), list) and data["messages"]:
-                    return (data["messages"][-1].get("content") or "").strip() or _simple_summary(prompt)
-                return _simple_summary(prompt)
-        except Exception as e:
-            log_message(f"[auxiliary_inference] fallback due to {e}", "WARNING")
-            return _simple_summary(prompt)
-
-    # ---- Selenium helpers ----------------------------------------------------
+    # ── Driver lifecycle ──────────────────────────────────────────────────────
     @staticmethod
     def _find_system_chromedriver() -> Optional[str]:
+        "Return a usable chromedriver path if one is available on the system."
         candidates: List[Optional[str]] = [
             shutil.which("chromedriver"),
             "/usr/bin/chromedriver",
@@ -920,13 +780,22 @@ class Tools:
         return None
 
     @staticmethod
-    def open_browser(headless: bool = False, force_new: bool = False) -> str:
-        import random, platform
+    def open_browser(headless: bool = False, force_new: bool = False, window_size: str = "1920,1080") -> str:
+        """
+        Launch a Chrome/Chromium browser with resilient fallbacks.
+        - headless: run headless mode if True (default False for better compatibility)
+        - force_new: close any existing singleton before launching
+        - window_size: 'WIDTH,HEIGHT' string
+        Returns a human-readable status string.
+        """
         from selenium import webdriver
         from selenium.common.exceptions import WebDriverException
         from selenium.webdriver.chrome.service import Service
         from selenium.webdriver.chrome.options import Options
-        from webdriver_manager.chrome import ChromeDriverManager
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+        except Exception:
+            ChromeDriverManager = None  # optional
 
         if force_new and Tools._driver:
             try:
@@ -951,47 +820,46 @@ class Tools:
         if chrome_bin:
             opts.binary_location = chrome_bin
         if headless:
+            # modern headless for Chrome 109+
             opts.add_argument("--headless=new")
-        opts.add_argument("--window-size=1920,1080")
+        opts.add_argument(f"--window-size={window_size}")
         opts.add_argument("--disable-gpu")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--remote-allow-origins=*")
-        opts.add_argument(f"--remote-debugging-port={random.randint(45000,65000)}")
+        opts.add_argument("--disable-infobars")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
 
+        # Try Selenium-Manager first (bundled with Selenium 4.6+)
         try:
             log_message("[open_browser] Trying Selenium-Manager…", "DEBUG")
             Tools._driver = webdriver.Chrome(options=opts)
+            Tools._driver.set_page_load_timeout(20)
+            Tools._driver.implicitly_wait(0)  # agentic flows rely on explicit waits
             log_message("[open_browser] Launched via Selenium-Manager.", "SUCCESS")
             return "Browser launched (selenium-manager)"
         except WebDriverException as e:
             log_message(f"[open_browser] Selenium-Manager failed: {e}", "WARNING")
 
-        snap_drv = "/snap/chromium/current/usr/lib/chromium-browser/chromedriver"
-        if os.path.exists(snap_drv):
-            try:
-                log_message(f"[open_browser] Using snap chromedriver at {snap_drv}", "DEBUG")
-                Tools._driver = webdriver.Chrome(service=Service(snap_drv), options=opts)
-                log_message("[open_browser] Launched via snap chromedriver.", "SUCCESS")
-                return "Browser launched (snap chromedriver)"
-            except WebDriverException as e:
-                log_message(f"[open_browser] Snap chromedriver failed: {e}", "WARNING")
-
-        sys_drv = Tools._find_system_chromedriver()
-        if sys_drv:
-            try:
-                log_message(f"[open_browser] Trying system chromedriver at {sys_drv}", "DEBUG")
+        # Try system chromedriver
+        try:
+            sys_drv = Tools._find_system_chromedriver()
+            if sys_drv:
                 Tools._driver = webdriver.Chrome(service=Service(sys_drv), options=opts)
+                Tools._driver.set_page_load_timeout(20)
+                Tools._driver.implicitly_wait(0)
                 log_message("[open_browser] Launched via system chromedriver.", "SUCCESS")
                 return "Browser launched (system chromedriver)"
-            except WebDriverException as e:
-                log_message(f"[open_browser] System chromedriver failed: {e}", "WARNING")
+        except WebDriverException as e:
+            log_message(f"[open_browser] System chromedriver failed: {e}", "WARNING")
 
-        arch = platform.machine().lower()
-        if arch in ("x86_64","amd64"):
+        # Try webdriver-manager if available and arch supports it
+        if ChromeDriverManager is not None and platform.machine().lower() in ("x86_64","amd64","arm64","aarch64"):
             try:
                 drv_path = ChromeDriverManager().install()
                 Tools._driver = webdriver.Chrome(service=Service(drv_path), options=opts)
+                Tools._driver.set_page_load_timeout(20)
+                Tools._driver.implicitly_wait(0)
                 log_message("[open_browser] Launched via webdriver-manager.", "SUCCESS")
                 return "Browser launched (webdriver-manager)"
             except Exception as e:
@@ -1001,6 +869,7 @@ class Tools:
 
     @staticmethod
     def close_browser() -> str:
+        "Close and cleanup the singleton driver."
         if Tools._driver:
             try:
                 Tools._driver.quit()
@@ -1011,431 +880,449 @@ class Tools:
             return "Browser closed"
         return "No browser to close"
 
+    # ── Navigation + waits ────────────────────────────────────────────────────
     @staticmethod
-    def navigate(url: str) -> str:
+    def navigate(url: str, wait_complete: bool = True, timeout: int = 15) -> str:
+        """
+        Navigate current tab to URL.
+        - wait_complete: wait for document.readyState==='complete'
+        - timeout: seconds to wait for readiness
+        """
         if not Tools._driver:
             return "Error: browser not open"
+        drv = Tools._driver
         log_message(f"[navigate] → {url}", "DEBUG")
-        Tools._driver.get(url)
+        drv.get(url)
+        if wait_complete:
+            end = time.time() + timeout
+            while time.time() < end:
+                try:
+                    state = drv.execute_script("return document.readyState")
+                    if state == "complete":
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.1)
         return f"Navigated to {url}"
 
     @staticmethod
-    def click(selector: str, timeout: int = 8) -> str:
+    def wait_for(selector: str, timeout: int = 8, state: str = "visible") -> str:
+        """
+        Wait for an element to reach a desired state.
+        state ∈ {'visible','clickable','present','hidden','gone'}
+        """
         if not Tools._driver:
             return "Error: browser not open"
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+
+        drv = Tools._driver
+        wait = WebDriverWait(drv, timeout, poll_frequency=0.1)
+
         try:
-            from selenium.webdriver.common.by import By
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.support import expected_conditions as EC
+            if state == "clickable":
+                wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+            elif state == "visible":
+                wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, selector)))
+            elif state == "present":
+                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
+            elif state == "hidden":
+                wait.until(EC.invisibility_of_element_located((By.CSS_SELECTOR, selector)))
+            elif state == "gone":
+                wait.until_not(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
+            else:
+                return f"Error: unknown state {state!r}"
+            return f"wait_for: {selector} is {state}"
+        except Exception as e:
+            return f"Error waiting for {selector} to be {state}: {e}"
+
+    @staticmethod
+    def current_url() -> str:
+        "Return the current page URL."
+        if not Tools._driver:
+            return "Error: browser not open"
+        return Tools._driver.current_url
+
+    @staticmethod
+    def go_back(wait_complete: bool = True, timeout: int = 10) -> str:
+        "Navigate back in history."
+        if not Tools._driver:
+            return "Error: browser not open"
+        drv = Tools._driver
+        drv.back()
+        if wait_complete:
+            end = time.time() + timeout
+            while time.time() < end:
+                try:
+                    if drv.execute_script("return document.readyState") == "complete":
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.1)
+        return "Went back"
+
+    # ── Element interactions ──────────────────────────────────────────────────
+    @staticmethod
+    def click(selector: str, timeout: int = 8, focus: bool = True, scroll: bool = True) -> str:
+        """
+        Click the first element that matches selector.
+        - focus: move focus before clicking
+        - scroll: scroll element into view before clicking
+        """
+        if not Tools._driver:
+            return "Error: browser not open"
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+
+        try:
             drv = Tools._driver
-            el = WebDriverWait(drv, timeout).until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
-            drv.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            el = WebDriverWait(drv, timeout, poll_frequency=0.1).until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+            if scroll:
+                drv.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            if focus:
+                drv.execute_script("arguments[0].focus({preventScroll:true});", el)
             el.click()
             return f"Clicked {selector}"
         except Exception as e:
             log_message(f"[click] Error clicking {selector}: {e}", "ERROR")
             return f"Error clicking {selector}: {e}"
-            
+
     @staticmethod
-    def input(selector: str = "", text: Optional[str] = None, timeout: int = 8, **kwargs) -> str:
+    def input(selector: str = "", text: Optional[str] = None, timeout: int = 8, submit: bool = False, clear: bool = True, **kwargs) -> str:
+        """
+        Type into an input/textarea/contenteditable.
+        - selector: CSS selector; if blank, use active element or first text-like input
+        - text: text to send (alias: pass 'prompt' in kwargs for backwards compatibility)
+        - submit: send Enter/Return at end if True
+        - clear: attempt to clear existing value first
+        """
         if not Tools._driver:
             return "Error: browser not open"
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.webdriver.common.keys import Keys
+
+        drv = Tools._driver
+        if text is None:
+            text = kwargs.get("prompt")
+        if text is None:
+            return "Error: no text provided"
+
         try:
-            from selenium.webdriver.common.by import By
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.support import expected_conditions as EC
-            from selenium.webdriver.common.keys import Keys
-
-            drv = Tools._driver
-            if text is None:
-                text = kwargs.get("prompt")
-            if text is None:
-                return "Error: no text provided"
-
             # choose element: explicit selector → active element → first typical input
             if selector:
-                el = WebDriverWait(drv, timeout).until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+                el = WebDriverWait(drv, timeout, poll_frequency=0.1).until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
             else:
                 try:
                     el = drv.switch_to.active_element
                 except Exception:
                     el = None
                 if not el:
-                    cands = drv.find_elements(
-                        By.CSS_SELECTOR,
-                        "input[type='text'], input:not([type]), textarea, [contenteditable=''], [contenteditable='true']"
-                    )
+                    cands = drv.find_elements(By.CSS_SELECTOR, "input[type='text'], input:not([type]), textarea, [contenteditable=''], [contenteditable='true']")
                     if not cands:
                         return "Error: no input element found"
                     el = cands[0]
 
             drv.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-            try:
-                el.clear()
-            except Exception:
-                pass
-
+            drv.execute_script("arguments[0].focus({preventScroll:true});", el)
+            if clear:
+                try:
+                    el.clear()
+                except Exception:
+                    # fallback: select-all + delete
+                    el.send_keys(Keys.CONTROL, "a"); el.send_keys(Keys.DELETE)
             el.send_keys(str(text))
-            if bool(kwargs.get("submit", True)):
+            if submit:
                 el.send_keys(Keys.RETURN)
-
             return f"Sent {text!r} to {selector or '[active/input]'}"
         except Exception as e:
             log_message(f"[input] Error typing into {selector or '[auto]'}: {e}", "ERROR")
             return f"Error typing into {selector or '[auto]'}: {e}"
 
     @staticmethod
+    def press_keys(keys: str) -> str:
+        """
+        Send key chords to the active element or <body>.
+        Example keys: 'CTRL+A', 'ESC', 'ENTER', 'TAB', 'SHIFT+TAB'
+        """
+        if not Tools._driver:
+            return "Error: browser not open"
+        from selenium.webdriver.common.keys import Keys
+        drv = Tools._driver
+        mapping = {
+            "CTRL":"CONTROL", "CONTROL":"CONTROL",
+            "ALT":"ALT", "SHIFT":"SHIFT",
+            "ENTER":"ENTER", "RETURN":"RETURN", "ESC":"ESCAPE",
+            "ESCAPE":"ESCAPE", "TAB":"TAB", "BACKSPACE":"BACKSPACE",
+        }
+        seq = []
+        for token in keys.replace("+"," + ").split():
+            name = token.strip().upper()
+            if name == "+": continue
+            key = getattr(Keys, mapping.get(name, name), None)
+            if key is None:
+                seq.append(token)  # literal text
+            else:
+                seq.append(key)
+        try:
+            target = None
+            try:
+                target = drv.switch_to.active_element
+            except Exception:
+                pass
+            if not target:
+                target = drv.find_element("css selector","body")
+            for part in seq:
+                target.send_keys(part)
+            return f"Pressed keys: {keys}"
+        except Exception as e:
+            return f"Error pressing keys {keys!r}: {e}"
+
+    @staticmethod
+    def select_option(selector: str, by: str = "value", value: str = "") -> str:
+        """
+        Select an option in a <select> element.
+        - by: 'value' | 'text' | 'index'
+        - value: value/text/index string
+        """
+        if not Tools._driver:
+            return "Error: browser not open"
+        from selenium.webdriver.support.ui import Select
+        try:
+            el = Tools._driver.find_element("css selector", selector)
+            sel = Select(el)
+            if by == "value":
+                sel.select_by_value(value)
+            elif by == "text":
+                sel.select_by_visible_text(value)
+            elif by == "index":
+                sel.select_by_index(int(value))
+            else:
+                return f"Error: unknown 'by' {by!r}"
+            return f"Selected {value!r} by {by} in {selector}"
+        except Exception as e:
+            return f"Error selecting option in {selector}: {e}"
+
+    @staticmethod
+    def scroll(to: str = "bottom", amount: int = 600) -> str:
+        """
+        Scroll the page.
+        - to: 'top' | 'bottom' | 'amount'
+        - amount: pixels if to=='amount' (positive: down, negative: up)
+        """
+        if not Tools._driver:
+            return "Error: browser not open"
+        drv = Tools._driver
+        try:
+            if to == "top":
+                drv.execute_script("window.scrollTo({top:0, behavior:'instant'});")
+            elif to == "bottom":
+                drv.execute_script("window.scrollTo({top:document.body.scrollHeight, behavior:'instant'});")
+            elif to == "amount":
+                drv.execute_script("window.scrollBy(0, arguments[0]);", int(amount))
+            else:
+                return f"Error: unknown target {to!r}"
+            return f"Scrolled {to}"
+        except Exception as e:
+            return f"Error scrolling: {e}"
+
+    # ── Observation & queries (for agentic decisions) ─────────────────────────
+    @staticmethod
+    def exists(selector: str, timeout: int = 0) -> bool:
+        "Return True if at least one element exists; optionally wait up to timeout seconds."
+        if not Tools._driver:
+            return False
+        from selenium.webdriver.common.by import By
+        if timeout > 0:
+            # simple poll
+            end = time.time() + timeout
+            while time.time() < end:
+                try:
+                    if Tools._driver.find_elements(By.CSS_SELECTOR, selector):
+                        return True
+                except Exception:
+                    pass
+                time.sleep(0.1)
+            return False
+        try:
+            return bool(Tools._driver.find_elements(By.CSS_SELECTOR, selector))
+        except Exception:
+            return False
+
+    @staticmethod
+    def count(selector: str) -> int:
+        "Return number of elements matching selector."
+        if not Tools._driver:
+            return 0
+        from selenium.webdriver.common.by import By
+        try:
+            return len(Tools._driver.find_elements(By.CSS_SELECTOR, selector))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def get_text(selector: str, all: bool = False, sep: str = "\\n") -> Union[str, List[str]]:
+        """
+        Extract visible text from elements.
+        - all=False: text from first match
+        - all=True: list of texts for all matches
+        """
+        if not Tools._driver:
+            return "Error: browser not open"
+        from selenium.webdriver.common.by import By
+        drv = Tools._driver
+        try:
+            els = drv.find_elements(By.CSS_SELECTOR, selector)
+            if not els:
+                return "" if not all else []
+            if not all:
+                return els[0].text.strip()
+            return [e.text.strip() for e in els]
+        except Exception as e:
+            return f"Error get_text({selector}): {e}"
+
+    @staticmethod
+    def get_attr(selector: str, attr: str, all: bool = False) -> Union[str, List[str]]:
+        "Get attribute from first/all elements matching selector."
+        if not Tools._driver:
+            return "Error: browser not open"
+        from selenium.webdriver.common.by import By
+        drv = Tools._driver
+        try:
+            els = drv.find_elements(By.CSS_SELECTOR, selector)
+            if not els:
+                return "" if not all else []
+            if not all:
+                return (els[0].get_attribute(attr) or "").strip()
+            return [(e.get_attribute(attr) or "").strip() for e in els]
+        except Exception as e:
+            return f"Error get_attr({selector}, {attr}): {e}"
+
+    @staticmethod
+    def observe(max_nodes: int = 50) -> Dict[str, Any]:
+        """
+        Return a compact snapshot of the current page for agentic evaluation:
+        {url, title, readyState, viewport:{w,h,scrollY}, dom:[{tag,id,cls,text,href,aria,label}...]}
+        """
+        if not Tools._driver:
+            return {"error": "browser not open"}
+        drv = Tools._driver
+        try:
+            data = drv.execute_script("""
+                const lim = arguments[0] || 50;
+                const nodes = [];
+                const q = document.querySelectorAll("h1,h2,h3,h4,button,a,input,textarea,select,[role],[aria-label]");
+                const take = Array.from(q).slice(0, lim);
+                for (const el of take) {
+                  const tag = el.tagName.toLowerCase();
+                  const id = el.id || "";
+                  const cls = (el.className || "").toString();
+                  const text = (el.innerText || el.value || "").trim().slice(0, 160);
+                  const href = (el.getAttribute && el.getAttribute("href")) || "";
+                  const role = el.getAttribute && el.getAttribute("role") || "";
+                  const aria = el.getAttribute && el.getAttribute("aria-label") || "";
+                  const name = el.getAttribute && (el.getAttribute("name") || el.getAttribute("data-testid") || "");
+                  nodes.push({tag, id, cls, text, href, role, aria, name});
+                }
+                return {
+                  url: location.href,
+                  title: document.title,
+                  readyState: document.readyState,
+                  viewport: { w: innerWidth, h: innerHeight, scrollY: scrollY },
+                  dom: nodes
+                };
+            """, int(max_nodes))
+            return data
+        except Exception as e:
+            return {"error": str(e)}
+
+    @staticmethod
+    def eval_js(script: str) -> Any:
+        "Evaluate a short JavaScript snippet in the page context and return its JSON-serializable result."
+        if not Tools._driver:
+            return {"error": "browser not open"}
+        try:
+            return Tools._driver.execute_script("return (function(){try{return (" + script + ");}catch(e){return String(e);}})();")
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ── Page source & screenshots ─────────────────────────────────────────────
+    @staticmethod
     def get_html() -> str:
+        "Return full page HTML."
         if not Tools._driver:
             return "Error: browser not open"
         return Tools._driver.page_source
 
     @staticmethod
     def screenshot(filename: str = "screenshot.png") -> str:
+        "Save a screenshot to the given filename (relative to working dir). Returns the filename or error."
         if not Tools._driver:
             return "Error: browser not open"
-        Tools._driver.save_screenshot(filename)
-        return filename
+        try:
+            Tools._driver.save_screenshot(filename)
+            return filename
+        except Exception as e:
+            return f"Error taking screenshot: {e}"
 
-    # ---- Internet Search (DuckDuckGo) ---------------------------------------
+    # ── Simple DuckDuckGo web search (agentic-friendly) ───────────────────────
     @staticmethod
-    def search_internet(topic: str, num_results: int = 5, wait_sec: int = 1, deep_scrape: bool = True, summarize: bool = True, bs4_verbose: bool = False, **kwargs) -> List[Dict[str, Any]]:
+    def search_internet(topic: str, num_results: int = 5, wait_sec: int = 2, deep_scrape: bool = True, summarize: bool = False) -> List[Dict[str, Any]]:
         """
-        DuckDuckGo search and optional deep-scrape. Returns:
-        [{title,url,snippet,content,aux_summary?}, ...]
+        Headless DuckDuckGo search with optional deep scrape.
+        Returns list of {title, url, snippet, content?}.
         """
-        # aliasing
-        if "top_n" in kwargs: num_results = kwargs.pop("top_n")
-        if "n" in kwargs: num_results = kwargs.pop("n")
-        if "limit" in kwargs: num_results = kwargs.pop("limit")
-        if kwargs:
-            log_message(f"[search_internet] Ignoring unexpected args: {list(kwargs.keys())!r}", "WARNING")
-
-        log_message(f"[search_internet] ▶ {topic!r} (num_results={num_results}, summarize={summarize}, bs4_verbose={bs4_verbose})", "INFO")
-        wait_sec = min(wait_sec, 5)
-        results: List[Dict[str, Any]] = []
-
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
-        from selenium.webdriver.common.keys import Keys
         from selenium.common.exceptions import TimeoutException
 
-        Tools.close_browser()
-        Tools.open_browser(headless=True, force_new=True)
-        drv = Tools._driver
-        wait = WebDriverWait(drv, wait_sec, poll_frequency=0.1)
-
-        try:
-            drv.get("https://duckduckgo.com/")
-            wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-
-            # Dismiss cookie banner if present
-            try:
-                btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button#onetrust-accept-btn-handler")))
-                btn.click()
-            except TimeoutException:
-                pass
-
-            # Locate search box
-            selectors = ("input#search_form_input_homepage","input#searchbox_input","input[name='q']")
-            box = None
-            for sel in selectors:
-                els = drv.find_elements(By.CSS_SELECTOR, sel)
-                if els:
-                    box = els[0]; break
-            if not box:
-                raise RuntimeError("Search box not found")
-
-            drv.execute_script("arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('input')); arguments[0].form.submit();", box, topic)
-
-            # Wait for results
-            try:
-                wait.until(lambda d: "?q=" in d.current_url)
-                wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, "#links .result, #links [data-nr]"))
-            except TimeoutException:
-                log_message("[search_internet] Results timeout.", "WARNING")
-
-            anchors = drv.find_elements(By.CSS_SELECTOR, "a.result__a, a[data-testid='result-title-a']")[:num_results]
-            main_handle = drv.current_window_handle
-
-            for a in anchors:
-                try:
-                    href = a.get_attribute("href")
-                    title = a.text.strip() or drv.execute_script("return arguments[0].innerText;", a)
-                    snippet = ""
-                    try:
-                        parent = a.find_element(By.XPATH, "./ancestor::*[contains(@class,'result')][1]")
-                        sn = parent.find_element(By.CSS_SELECTOR, ".result__snippet, span[data-testid='result-snippet']")
-                        snippet = sn.text.strip()
-                    except Exception:
-                        pass
-
-                    page_content = ""
-
-                    if deep_scrape and href:
-                        drv.switch_to.new_window("tab")
-                        TAB_DEADLINE = time.time() + 10
-                        drv.set_page_load_timeout(10)
-                        try:
-                            drv.get(href)
-                        except TimeoutException:
-                            log_message(f"[search_internet] page-load timeout for {href!r}", "WARNING")
-
-                        drv.execute_script("window._lastMut = Date.now(); new MutationObserver(function(){window._lastMut = Date.now();}).observe(document,{childList:true,subtree:true,attributes:true});")
-                        STABLE_MS = 500
-                        while True:
-                            if time.time() >= TAB_DEADLINE:
-                                break
-                            last = drv.execute_script("return window._lastMut;")
-                            if (time.time()*1000) - last > STABLE_MS:
-                                break
-                            time.sleep(0.1)
-
-                        drv.close()
-                        drv.switch_to.window(main_handle)
-
-                        page_content = Tools.bs4_scrape(href, verbosity=bs4_verbose)
-
-                    aux_summary = ""
-                    if summarize:
-                        try:
-                            aux_prompt = (
-                                f"Using the search topic «{topic}» as your guide, extract the most relevant information from this page text:\\n\\n"
-                                f"{page_content}"
-                            )
-                            aux_summary = Tools.auxiliary_inference(prompt=aux_prompt, temperature=0.3)
-                        except Exception as ex:
-                            log_message(f"[search_internet] auxiliary_inference error: {ex}", "WARNING")
-
-                    entry = {"title": title, "url": href, "snippet": snippet, "content": page_content}
-                    if summarize:
-                        entry["aux_summary"] = aux_summary
-                    results.append(entry)
-
-                except Exception as ex:
-                    log_message(f"[search_internet] result error: {ex}", "WARNING")
-                    continue
-
-        except Exception as e:
-            log_message(f"[search_internet] Fatal: {e}\\n{traceback.format_exc()}", "ERROR")
-        finally:
-            Tools.close_browser()
-
-        log_message(f"[search_internet] Collected {len(results)} results.", "SUCCESS")
-        return results
-
-    @staticmethod
-    def search_images(topic: str, num_results: int = 5, wait_sec: int = 1, headless: bool = True, summarize: bool = False, **kwargs) -> List[Dict[str, Any]]:
-        import requests
-        from urllib.parse import quote_plus
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-
-        for alias in ("top_n","n","limit"):
-            if alias in kwargs:
-                num_results = int(kwargs.pop(alias))
-        if kwargs:
-            log_message(f"[search_images] Ignoring unexpected args: {list(kwargs)}", "WARNING")
-
-        wait_sec = min(wait_sec, 5)
         results: List[Dict[str, Any]] = []
-
         try:
             Tools.close_browser()
-            Tools.open_browser(headless=headless, force_new=True)
+            Tools.open_browser(headless=True, force_new=True)
             drv = Tools._driver
             wait = WebDriverWait(drv, wait_sec, poll_frequency=0.1)
-
-            url = f"https://duckduckgo.com/?iax=images&ia=images&q={quote_plus(topic)}"
-            drv.get(url)
+            drv.get("https://duckduckgo.com/")
             wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-            wait.until(EC.presence_of_element_located((By.ID, "react-layout")))
-
-            thumb_css = "#react-layout img.tile--img__img"
-            thumbs = drv.find_elements(By.CSS_SELECTOR, thumb_css)
-            attempts = 0
-            while len(thumbs) < num_results and attempts < 5:
-                drv.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(1)
-                thumbs = drv.find_elements(By.CSS_SELECTOR, thumb_css)
-                attempts += 1
-
-            for thumb in thumbs[:num_results]:
-                try:
-                    src_url = thumb.get_attribute("data-src") or thumb.get_attribute("src")
-                    if not src_url:
-                        continue
-                    try:
-                        r = requests.get(src_url, timeout=5); r.raise_for_status()
-                        ext = os.path.splitext(src_url.split("?")[0])[1] or ".jpg"
-                        path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}{ext}")
-                        with open(path,"wb") as f: f.write(r.content)
-                    except Exception as dl_err:
-                        log_message(f"[search_images] download failed: {src_url} → {dl_err}", "WARNING")
-                        continue
-                    entry = {"file_path": path, "src_url": src_url}
-                    if summarize:
-                        try:
-                            entry["aux_summary"] = Tools.auxiliary_inference(prompt=f"Provide a concise description of the image at URL: {src_url}", temperature=0.2)
-                        except Exception:
-                            pass
-                    results.append(entry)
-                except Exception as ex:
-                    log_message(f"[search_images] result error: {ex}", "WARNING")
-                    continue
-        except Exception as e:
-            log_message(f"[search_images] Fatal: {e}\\n{traceback.format_exc()}", "ERROR")
-        finally:
-            Tools.close_browser()
-
-        log_message(f"[search_images] Collected {len(results)} images", "SUCCESS")
-        return results
-
-    @staticmethod
-    def selenium_extract_summary(url: str, wait_sec: int = 8) -> str:
-        """
-        Fast two-stage page summariser:
-          1) Try bs4_scrape (requests) for quick text/meta
-          2) Fallback to headless Selenium and parse first <meta desc> or <p>
-        """
-        try:
-            from bs4 import BeautifulSoup
-        except Exception:
-            BeautifulSoup = None
-
-        html_doc = Tools.bs4_scrape(url, verbosity=True)
-        if html_doc and BeautifulSoup:
-            pg = BeautifulSoup(html_doc, "html5lib")
-            m = pg.find("meta", attrs={"name": "description"})
-            if m and m.get("content"):
-                return m["content"].strip()
-            p = pg.find("p")
-            if p:
-                return p.get_text(strip=True)
-
-        # Selenium fallback
-        try:
-            Tools.open_browser(headless=True)
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.common.by import By
-            drv = Tools._driver
-            wait = WebDriverWait(drv, wait_sec)
-            drv.get(url)
+            box = drv.find_element(By.CSS_SELECTOR, "input[name='q']")
+            box.send_keys(topic)
+            box.submit()
             try:
-                wait.until(lambda d: d.find_elements(By.TAG_NAME, "body"))
-            except Exception:
+                wait.until(lambda d: "?q=" in d.current_url)
+            except TimeoutException:
                 pass
-            if BeautifulSoup:
-                pg2 = BeautifulSoup(drv.page_source, "html5lib")
-                m2 = pg2.find("meta", attrs={"name": "description"})
-                if m2 and m2.get("content"):
-                    return m2["content"].strip()
-                p2 = pg2.find("p")
-                if p2:
-                    return p2.get_text(strip=True)
-            return ""
+            anchors = drv.find_elements(By.CSS_SELECTOR, "a.result__a, a[data-testid='result-title-a']")[:num_results]
+            for a in anchors:
+                href = a.get_attribute("href")
+                title = a.text.strip() or drv.execute_script("return arguments[0].innerText;", a)
+                snippet = ""
+                try:
+                    parent = a.find_element(By.XPATH, "./ancestor::*[contains(@class,'result')][1]")
+                    sn = parent.find_element(By.CSS_SELECTOR, ".result__snippet, span[data-testid='result-snippet']")
+                    snippet = sn.text.strip()
+                except Exception:
+                    pass
+                content = ""
+                if deep_scrape and href:
+                    try:
+                        content = bs4_scrape(href, timeout_s=8, full_html=False)[:10000]
+                    except Exception:
+                        content = ""
+                entry = {"title": title, "url": href, "snippet": snippet}
+                if content:
+                    entry["content"] = content
+                results.append(entry)
+        except Exception as e:
+            log_message(f"[search_internet] error: {e}", "ERROR")
         finally:
             Tools.close_browser()
-
-    @staticmethod
-    def summarize_local_search(topic: str, top_n: int = 3, deep: bool = False) -> str:
-        try:
-            entries = Tools.search_internet(topic, num_results=top_n, deep_scrape=deep)
-        except Exception as e:
-            return f"Search error: {e}"
-        if not entries:
-            return "No results found."
-        lines = []
-        for i, e in enumerate(entries, 1):
-            title = e.get("title") or e.get("url") or "(untitled)"
-            summary = e.get("aux_summary") or e.get("snippet") or "(no summary)"
-            lines.append(f"{i}. {title} — {summary}")
-        return "\\n".join(lines)
-
-    @staticmethod
-    def summarize_search(topic: str, top_n: int = 3) -> str:
-        try:
-            pages = Tools.search_internet(topic=topic, num_results=top_n, deep_scrape=True)
-        except Exception as e:
-            return f"Error retrieving search pages: {e}"
-
-        if not pages:
-            return "No results found."
-
-        summaries = []
-        for i, page in enumerate(pages, start=1):
-            url   = page.get("url", "")
-            title = page.get("title", url or "(untitled)")
-            content = page.get("content", "") or page.get("snippet", "")
-            snippet = (content or "")[:2000].replace("\\n", " ")
-
-            prompt = (
-                f"Here is the content of {url}:\\n\\n"
-                f"{snippet}\\n\\n"
-                "Please give me a 2–3 sentence summary of the key points."
-            )
-
-            try:
-                summary = Tools.auxiliary_inference(prompt=prompt, temperature=0.3).strip()
-            except Exception:
-                # minimal fallback to keep tool deterministic
-                summary = (snippet[:300] + ("..." if len(snippet) > 300 else "")) or "(no content)"
-            summaries.append(f"{i}. {title} — {summary}")
-
-        return "\\n".join(summaries)
-
-    @staticmethod
-    def bs4_scrape(url: str, verbosity: bool = False) -> str:
-        import random
-        import requests
-        from bs4 import BeautifulSoup
-
-        USER_AGENTS = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-        ]
-
-        session = requests.Session()
-        html_text = ""
-        for attempt in range(3):
-            headers = {
-                "User-Agent": random.choice(USER_AGENTS),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Connection": "keep-alive",
-                "Referer": url,
-            }
-            try:
-                resp = session.get(url, headers=headers, timeout=6)
-                resp.raise_for_status()
-                html_text = resp.text
-                break
-            except requests.HTTPError as e:
-                code = getattr(e.response, "status_code", None)
-                if code in (403, 429):
-                    time.sleep(0.8)
-                    continue
-                else:
-                    log_message(f"[bs4_scrape] HTTP error for {url!r}: {e}", "ERROR")
-                    break
-            except Exception as e:
-                log_message(f"[bs4_scrape] Error during scraping {url!r}: {e}", "ERROR")
-                break
-
-        if not html_text:
-            return ""
-
-        if not verbosity:
-            soup = BeautifulSoup(html_text, "html.parser")
-            for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside", "form"]):
-                tag.decompose()
-            return soup.get_text(separator=" ", strip=True)
-
-        return html_text
+        return results
 '''
+
 
 if not TOOLS_PATH.exists():
     print(_c("RUN", "Creating default tools.py ..."))
@@ -1649,78 +1536,205 @@ def _extract_json_map(content: str) -> Dict[str, Any]:
     # final attempt
     return json.loads(s)
 
-def ensure_docs(tools: List[ToolSpec], force: bool=False) -> Dict[str, Any]:
-    if DOCS_PATH.exists() and not force:
-        try:
-            return jload(DOCS_PATH, {})
-        except Exception:
-            pass
+def ensure_docs(tools: List["ToolSpec"], force: bool=False) -> Dict[str, Any]:
+    """
+    Generate and persist tool docs one function at a time to avoid overwhelming the doc writer.
 
-    payload = [
-        {
+    Behavior:
+      - Loads existing docs from DOCS_PATH (mapping: tool_name -> doc).
+      - For each tool, computes a stable fingerprint of its signature+docstring.
+      - If not force and fingerprint matches what's stored, skips regeneration.
+      - Otherwise, calls the doc writer for that SINGLE tool only.
+      - Saves/updates docs.json incrementally after each tool.
+      - Also writes a per-tool JSON under data/tool_docs/<tool>.json for clarity.
+
+    Return:
+      - The full docs mapping loaded+updated from disk.
+    """
+    existing = jload(DOCS_PATH, default={}) or {}
+    docs: Dict[str, Any] = dict(existing)
+
+    # Local helper: stable fingerprint so we only re-generate when needed
+    def _fingerprint(t: "ToolSpec") -> str:
+        import hashlib
+        base = {
+            "name": t.name,
+            "origin": t.origin,
+            "doc": t.doc or "",
+            "args": [(a.name, a.type, bool(a.required), (None if a.default is None else str(a.default))) for a in t.args],
+            "returns": t.returns or "",
+        }
+        raw = json.dumps(base, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    # One-tool-at-a-time prompt
+    SYSTEM = (
+        "You are ToolDocBot v2.\n"
+        "Goal: Given ONE Python tool (its name, origin, docstring, arg names/types/defaults, and return type), "
+        "produce a STRICT, single JSON object that fully captures how an autonomous agent should use it in complex, "
+        "real-world runs (including browser/network/stateful contexts). Do not return any prose outside JSON. "
+        "Do not include code fences.\n"
+        "\n"
+        "JSON schema to output (keys exactly as below):\n"
+        "{\n"
+        '  "purpose": str,                               # one sentence, crisp\n'
+        '  "when_to_use": [str, ...],                    # bullet-y triggers; be specific\n'
+        '  "preconditions": [str, ...],                  # env/state that MUST be true (e.g., open browser, network, cwd)\n'
+        '  "inputs": {                                   # one entry per arg; reflect real constraints\n'
+        '    "<arg>": {\n'
+        '      "desc": str,\n'
+        '      "type": str,                              # echo type info (Union, List[T], etc.)\n'
+        '      "required": bool,\n'
+        '      "default": any,                           # null if none\n'
+        '      "constraints": {                          # only include fields that apply\n'
+        '        "format": "url|path|css-selector|regex|json|number|text|enum|timeout-s|headers|payload",\n'
+        '        "regex": str,\n'
+        '        "enum": [any, ...],\n'
+        '        "min": number,\n'
+        '        "max": number,\n'
+        '        "min_len": int,\n'
+        '        "max_len": int,\n'
+        '        "units": "px|ms|s|bytes|…" ,\n'
+        '        "case_sensitive": bool,\n'
+        '        "example": any,\n'
+        '        "coupled_with": ["other_arg", ...]      # if values must be provided together\n'
+        '      }\n'
+        '    }, ...\n'
+        '  },\n'
+        '  "behavior": {\n'
+        '    "idempotent": bool,                         # true if repeated calls don’t alter state\n'
+        '    "deterministic": bool,                      # true if same inputs ⇒ same outputs\n'
+        '    "side_effects": [str, ...],                 # files written, navigation, clicks, network calls, memory writes\n'
+        '    "state_dependencies": [str, ...],           # e.g., Tools._driver is open; document.readyState==complete\n'
+        '    "timeouts": { "default_s": int, "notes": str },\n'
+        '    "retries": { "recommended": int, "strategy": "none|fixed|exponential", "backoff_s": number },\n'
+        '    "performance": { "expected_latency_ms": [low, high], "scaling_note": str }\n'
+        '  },\n'
+        '  "returns": {\n'
+        '    "type": str,                                # e.g., Dict[str, Any]\n'
+        '    "schema": any,                              # example-shaped object/array with key fields populated\n'
+        '    "notes": str,                               # nulls/sentinels, empty-shape behavior\n'
+        '    "success_criteria": [str, ...]              # how an agent can assert success from the output\n'
+        '  },\n'
+        '  "failure_modes": [                            # concrete, inspectable failure taxonomy\n'
+        '    { "case": str, "detect_by": str, "message": str, "recovery": str },\n'
+        '    ...\n'
+        '  ],\n'
+        '  "agent_playbook": {\n'
+        '    "happy_path": [str, ...],                   # step list the agent should follow with this tool\n'
+        '    "next_best_actions_on_failure": [str, ...], # fallbacks (e.g., wait_for → observe → retry with backoff)\n'
+        '    "pair_with_tools": [ { "tool": str, "why": str }, ... ]\n'
+        '  },\n'
+        '  "examples": [                                 # 1–3 concrete calls\n'
+        '    { "call": str, "explain": str },\n'
+        '    ...\n'
+        '  ]\n'
+        "}\n"
+        "\n"
+        "Authoring rules:\n"
+        "- Derive constraints from arg types, names, defaults, and docstring cues. If not knowable, omit the field; do NOT invent.\n"
+        "- If origin is 'class:Tools' or tool name starts with 'Tools.', assume a Selenium/DOM context and include browser preconditions "
+        "  (e.g., driver open via open_browser, page load readiness, selector existence) and side effects (click, input, scroll).\n"
+        "- If the tool name/doc references URL/HTTP/fetch, add network assumptions: DNS, TLS, headers, auth, rate limits, status handling.\n"
+        "- If the tool writes files (json_write, csv_write, screenshot), list paths/dirs touched in side_effects and success_criteria.\n"
+        "- Keep outputs compact but concrete. Prefer lists of short bullets over long prose.\n"
+        "- Output ONLY the JSON object. No markdown, no commentary, no code fences."
+    )
+
+
+    # Create a tidy per-tool folder (no global constant needed)
+    tool_docs_dir = DATA_DIR / "tool_docs"
+    tool_docs_dir.mkdir(exist_ok=True)
+
+    updated = 0
+    for t in tools:
+        fp = _fingerprint(t)
+        prev = docs.get(t.name)
+        if not force and isinstance(prev, dict) and prev.get("__fingerprint__") == fp:
+            # No change → keep existing
+            continue
+
+        payload = {
             "name": t.name,
             "origin": t.origin,
             "doc": t.doc,
-            "args": [a.model_dump() for a in t.args],
-            "returns": t.returns
+            "args": [
+                {
+                    "name": a.name,
+                    "type": a.type,
+                    "required": bool(a.required),
+                    "default": None if a.required else a.default,
+                }
+                for a in t.args
+            ],
+            "returns": t.returns,
         }
-        for t in tools
-    ]
 
-    SYSTEM = (
-        "You are ToolDocBot.\n"
-        "Given Python tools (docstrings, arg types/defaults, returns), output STRICT JSON mapping tool name → doc "
-        "with keys {purpose, when_to_use, args:{<arg>:desc}, returns, example}. No prose outside JSON."
-    )
-    USER = {"instruction": "Write JSON docs for these tools.", "tools_introspection": payload}
+        USER = {
+            "instruction": "Write JSON docs for THIS SINGLE TOOL only.",
+            "tool": payload,
+        }
 
-    print(_c("PLAN", "Generating tool docs ..."))
-
-    docs: Dict[str, Any] = {}
-    err_msg: Optional[str] = None
-
-    # Try streaming first
-    try:
-        msg = [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": json.dumps(USER, ensure_ascii=False)}
-        ]
-        if DEBUG:
-            _dbg("TOOLDOCS", msg)
-        content = _chat_stream_and_collect(msg, label="TOOLDOCS", options={"temperature": 0.1})
-        docs = _extract_json_map(content)
-    except Exception as e1:
-        err_msg = f"{e1}"
-        # Retry non-stream, even stricter instruction
+        print(_c("PLAN", f"Docgen → {t.name}"))
         try:
-            strict_msg = [
-                {"role":"system","content": SYSTEM + "\nReturn ONLY a single JSON object. No markdown fences."},
-                {"role":"user","content": json.dumps(USER, ensure_ascii=False)}
+            msgs = [
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": json.dumps(USER, ensure_ascii=False)},
             ]
-            content2 = _chat_stream_and_collect(strict_msg, label="TOOLDOCS-RETRY", options={"temperature": 0.0})
-            docs = _extract_json_map(content2)
-            err_msg = None
-        except Exception as e2:
-            err_msg = f"{err_msg}; {e2}"
+            if DEBUG:
+                _dbg(f"TOOLDOCS:{t.name}", msgs)
 
-    # If still no docs, fall back to introspection-only (quietly, as a WARN)
-    if not docs:
-        if err_msg:
-            print(_c("DBG", f"Tool docs JSON parse failed; using introspection-only. {err_msg}"))
-        docs = {
-            t.name: {
-                "purpose": (t.doc or f"{t.name} tool"),
-                "when_to_use": "When its purpose matches your need.",
-                "args": {a.name: f"{a.type}" for a in t.args},
-                "returns": t.returns,
-                "example": f"{t.name}({', '.join(a.name for a in t.args)})"
+            content = _chat_stream_and_collect(msgs, label=f"TOOLDOCS:{t.name}", options={"temperature": 0.1})
+            try:
+                doc_obj = _extract_json_map(content)
+                if not isinstance(doc_obj, dict) or not doc_obj:
+                    raise ValueError("empty or non-dict JSON")
+            except Exception:
+                # Fallback: introspection-only doc
+                doc_obj = {
+                    "purpose": (t.doc or f"{t.name} tool").strip(),
+                    "when_to_use": "Use when this tool's purpose matches your need.",
+                    "args": {a.name: f"{a.type} (required)" if a.required else f"{a.type} (optional, default={a.default})" for a in t.args},
+                    "returns": t.returns or "Any",
+                    "example": f"{t.name}({', '.join(a.name for a in t.args)})",
+                }
+        except Exception as e:
+            # Hard fallback if LLM call itself failed
+            doc_obj = {
+                "purpose": (t.doc or f"{t.name} tool").strip(),
+                "when_to_use": "Use when this tool's purpose matches your need.",
+                "args": {a.name: f"{a.type} (required)" if a.required else f"{a.type} (optional, default={a.default})" for a in t.args},
+                "returns": t.returns or "Any",
+                "example": f"{t.name}({', '.join(a.name for a in t.args)})",
+                "__error__": f"docgen_failed: {e}",
             }
-            for t in tools
+
+        # Stamp meta + fingerprint
+        doc_obj["__fingerprint__"] = fp
+        doc_obj["__meta__"] = {
+            "updated_at": _now_iso(),
+            "origin": t.origin,
         }
 
-    jdump(DOCS_PATH, docs)
-    print(_c("OK", f"Wrote {DOCS_PATH.name} with {len(docs)} entries."))
+        # Save to in-memory map and to disk immediately
+        docs[t.name] = doc_obj
+        try:
+            jdump(DOCS_PATH, docs)
+        except Exception as e:
+            print(_c("ERR", f"Failed writing {DOCS_PATH}: {e}"))
+
+        # Also save a per-tool JSON for clarity
+        try:
+            fname = t.name.replace(".", "_")
+            (tool_docs_dir / f"{fname}.json").write_text(json.dumps({t.name: doc_obj}, indent=2, ensure_ascii=False))
+        except Exception as e:
+            print(_c("ERR", f"Failed writing per-tool doc for {t.name}: {e}"))
+
+        updated += 1
+
+    print(_c("OK", f"Docs ready: {len(docs)} total, {updated} updated."))
     return docs
+
 
 
 def build_tool_registry(mod: types.ModuleType) -> Dict[str, Callable[..., Any]]:
