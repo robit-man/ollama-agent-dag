@@ -1762,6 +1762,90 @@ def validate_and_fix_placeholders(plan: Plan) -> Plan:
 
     return plan
 
+def _resolve_placeholders(args: Any, outputs: Dict[str, "ToolRecord"]) -> Any:
+    """
+    Replace bracketed placeholders in args with values from prior node records.
+
+    Supported forms inside strings:
+      - [<node_id>.output.<path>]
+      - [<node_id>.args.<path>]
+    <path> is dot-separated dict keys; list indices like '0' are supported when the
+    current value is a list. If the entire string is a single placeholder, the native
+    value is returned (not coerced to str). Otherwise, textual substitution is used.
+    Unknown/missing placeholders are left as-is.
+    """
+    PH = PLACEHOLDER_RE  # already defined above
+
+    def _lookup(token: str) -> Tuple[Any, bool]:
+        # token: "node_id.output.foo.bar" or "node_id.args.k"
+        parts = token.split(".")
+        if len(parts) < 3:
+            return None, False
+        node_id, root = parts[0], parts[1]
+        rec = outputs.get(node_id)
+        if not rec:
+            return None, False
+
+        obj = rec.output if root == "output" else rec.args_resolved
+        for key in parts[2:]:
+            if obj is None:
+                return None, True
+            # list index?
+            if isinstance(obj, list) and key.isdigit():
+                idx = int(key)
+                if 0 <= idx < len(obj):
+                    obj = obj[idx]
+                else:
+                    return None, True
+            elif isinstance(obj, dict):
+                if key in obj:
+                    obj = obj[key]
+                else:
+                    return None, True
+            else:
+                # conservative: no attribute walking by default
+                return None, True
+        return obj, True
+
+    def _replace_in_string(s: str) -> Any:
+        matches = list(PH.finditer(s))
+        if not matches:
+            return s
+        # If the entire string is a single placeholder, return the raw value
+        if len(matches) == 1 and matches[0].span() == (0, len(s)):
+            token = matches[0].group(1)
+            val, ok = _lookup(token)
+            return val if ok else s
+
+        # Otherwise, do textual substitution
+        out = s
+        for m in matches:
+            token = m.group(1)
+            val, ok = _lookup(token)
+            if ok:
+                if isinstance(val, (str, int, float)):
+                    rep = str(val)
+                elif isinstance(val, bool):
+                    rep = "true" if val else "false"
+                elif val is None:
+                    rep = "null"
+                else:
+                    # complex types: JSON-encode to keep things readable
+                    rep = json.dumps(val, ensure_ascii=False)
+                out = out.replace(f"[{token}]", rep)
+        return out
+
+    def _walk(x: Any) -> Any:
+        if isinstance(x, str):
+            return _replace_in_string(x)
+        if isinstance(x, list):
+            return [_walk(v) for v in x]
+        if isinstance(x, dict):
+            return {k: _walk(v) for k, v in x.items()}
+        return x
+
+    return _walk(args)
+
 
 def run_node(node: Node, registry: Dict[str, Callable[..., Any]], outputs: Dict[str, ToolRecord]) -> ToolRecord:
     start = time.time(); rec = ToolRecord(node_id=node.id, tool=node.tool, args_resolved=None)
@@ -1908,7 +1992,12 @@ def _chat_stream_text(
             msg = part.get("message") or {}
             chunk = msg.get("content") or ""
             if chunk:
-                # Print raw; collect for return
+                # NEW: keep console output ASCII-only during JSON-critical phases
+                if force_json:
+                    try:
+                        chunk = chunk.encode("ascii", "ignore").decode("ascii")
+                    except Exception:
+                        pass
                 print(chunk, end="", flush=True)
                 out_parts.append(chunk)
 
@@ -2043,6 +2132,14 @@ def plan_with_llm(goal: str, tools: List[ToolSpec], docs: Dict[str, Any], route_
         "TOOL_SIGNATURES": signatures,  # <-- new
     })
 
+    gl = (goal or "").lower()
+    target = _guess_target_file(goal)
+    if target and any(w in gl for w in ("content", "contents", "read", "show", "open", "print", "cat", "view")):
+        seeded = Plan(
+            nodes=[Node(id="read", tool="WorkspaceTools.read_file", args={"rel": target}, after=[])],
+            meta={"parallelism": 1, "timeout_s": 60}
+        )
+        return validate_and_fix_placeholders(_sanitize_and_coerce_plan(seeded))
     # Build a compact tool catalog for the planner (via WorkspaceTools.list_tools)
     try:
         tools_brief = REGISTRY["WorkspaceTools.list_tools"]("all")
@@ -2241,27 +2338,28 @@ def reflect_repair(goal: str, tools: List[ToolSpec], docs: Dict[str, Any], recor
 
 
 def assemble_final(goal: str, clarified: str, records: Dict[str, ToolRecord]) -> str:
-    # If we read a file, return its contents directly (no LLM needed for simple read).
-    for nid, rec in records.items():
-        if rec.tool.endswith("WorkspaceTools.read_file") or rec.tool == "WorkspaceTools.read_file":
+    # If there were errors, be explicit and stop.
+    errs = [r for r in records.values() if r.error]
+    if errs:
+        lines = [
+            f"- {r.node_id} ({r.tool}): {r.error.get('type')}: {r.error.get('message')}"
+            for r in errs
+        ]
+        return "I hit errors while executing the plan:\n" + "\n".join(lines)
+
+    # If we actually read a file, return it verbatim.
+    for rec in records.values():
+        if rec.tool == "WorkspaceTools.read_file" or rec.tool.endswith(".read_file"):
             out = rec.output or {}
             if isinstance(out, dict) and "text" in out and "path" in out:
-                path = out.get("path", "")
-                text = out.get("text", "")
-                return f"### {path}\n\n```\n{text}\n```"
+                return f"### {out.get('path','')}\n\n```\n{out.get('text','')}\n```"
 
-    # Otherwise, fall back to LLM assembly
+    # No errors and no file content — output factual tool summaries only.
     blocks = []
     for nid, rec in records.items():
         hdr = f"[tool:{rec.tool} → node={nid}] ({rec.elapsed_ms} ms)"
-        short = rec.stdout_short or ""
-        blocks.append(f"{hdr}\nsummary: {short}\njson: {json.dumps(rec.output)[:400]}")
-    SYSTEM = sysmsg("assemble")
-    user = {"goal": goal, "clarified": clarified, "tool_blocks": blocks}
-    try:
-        return _llm(SYSTEM, user, temp=0.2, label="ASSEMBLE", preface="Assemble concise final answer.")
-    except Exception as e:
-        return f"(finalization failed) {e}\n\nTool outputs:\n" + "\n\n".join(blocks)
+        blocks.append(f"{hdr}\njson: {json.dumps(rec.output)[:400]}")
+    return "Run completed without readable artifacts. Tool summaries:\n\n" + "\n\n".join(blocks)
 
 
 def qa_review(requested_edit: str, diff_text: str, verifications: Dict[str, Any]) -> Dict[str, Any]:
